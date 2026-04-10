@@ -14,7 +14,7 @@ Run with: streamlit run app.py   (from an Administrator PowerShell)
 import os
 import time
 import threading
-from collections import deque, defaultdict
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -47,6 +47,7 @@ FEATURE_NAMES = [
     "SYN Flag Count",
     "ACK Flag Count",
 ]
+ML_ATTACK_PROBA_THRESHOLD = 0.35  # lower than 0.5 to improve recall on live synthetic attacks
 
 # Rule-based thresholds
 SYN_FLOOD_THRESHOLD = 50       # SYN packets per window to consider suspicious
@@ -116,25 +117,43 @@ def _packet_callback(pkt):
 # ---------------------------------------------------------------------------
 # Feature Extraction — PER FLOW (not per window)
 #
-# CICIDS2017 features are per-flow, so we group packets by
-# (src_ip, dst_ip, src_port, dst_port) and compute features per flow.
+# CICIDS2017 features are per-flow, so we group packets bidirectionally
+# and keep forward/backward direction based on the first packet in a flow.
 # This produces feature vectors on the same scale the model was trained on.
 # ---------------------------------------------------------------------------
 def extract_flows(packets):
-    """Group packets into flows and extract per-flow features."""
+    """Group packets into bidirectional flows and extract per-flow features."""
     if not packets:
         return [], {}
 
-    # Group packets by flow key
-    flows = defaultdict(list)
+    # Group packets by bidirectional 4-tuple while preserving first-packet direction.
+    flows = {}
     for pkt in packets:
         if TCP not in pkt or IP not in pkt:
             continue
-        key = (pkt[IP].src, pkt[IP].dst, pkt[TCP].sport, pkt[TCP].dport)
-        flows[key].append(pkt)
+
+        src_endpoint = (pkt[IP].src, int(pkt[TCP].sport))
+        dst_endpoint = (pkt[IP].dst, int(pkt[TCP].dport))
+        flow_key = (
+            (src_endpoint, dst_endpoint)
+            if src_endpoint <= dst_endpoint
+            else (dst_endpoint, src_endpoint)
+        )
+
+        if flow_key not in flows:
+            flows[flow_key] = {
+                # Match CICFlowMeter semantics: first packet defines forward direction.
+                "forward_src_ip": pkt[IP].src,
+                "forward_src_port": int(pkt[TCP].sport),
+                "forward_dst_ip": pkt[IP].dst,
+                "forward_dst_port": int(pkt[TCP].dport),
+                "packets": [],
+            }
+
+        flows[flow_key]["packets"].append(pkt)
 
     flow_features_list = []
-    for (src, dst, sport, dport), flow_pkts in flows.items():
+    for flow in flows.values():
         fwd_count = 0
         bwd_count = 0
         fwd_lengths = []
@@ -142,17 +161,23 @@ def extract_flows(packets):
         syn_count = 0
         ack_count = 0
 
-        for pkt in flow_pkts:
+        for pkt in flow["packets"]:
             tcp = pkt[TCP]
-            payload_len = len(bytes(tcp.payload)) if tcp.payload else 0
-            is_fwd = (pkt[IP].src == src)
+            # Use full packet length (header + payload), not payload-only length.
+            pkt_len = len(pkt)
+            is_fwd = (
+                pkt[IP].src == flow["forward_src_ip"]
+                and int(tcp.sport) == flow["forward_src_port"]
+                and pkt[IP].dst == flow["forward_dst_ip"]
+                and int(tcp.dport) == flow["forward_dst_port"]
+            )
 
             if is_fwd:
                 fwd_count += 1
-                fwd_lengths.append(payload_len)
+                fwd_lengths.append(pkt_len)
             else:
                 bwd_count += 1
-                bwd_lengths.append(payload_len)
+                bwd_lengths.append(pkt_len)
 
             if tcp.flags & 0x02:
                 syn_count += 1
@@ -160,7 +185,7 @@ def extract_flows(packets):
                 ack_count += 1
 
         features = [
-            dport,
+            flow["forward_dst_port"],
             fwd_count,
             bwd_count,
             float(np.mean(fwd_lengths)) if fwd_lengths else 0.0,
@@ -299,11 +324,20 @@ def process_window():
 
     # ---- ML Model: predict on each flow, attack if ANY flow is attack ----
     ml_attack = False
+    ml_attack_mask = np.array([], dtype=bool)
+    ml_attack_scores = np.array([], dtype=float)
     if model and scaler:
-        X = np.array(flow_features_list)
+        X = np.array(flow_features_list, dtype=float)
         X_scaled = scaler.transform(X)
-        predictions = model.predict(X_scaled)
-        ml_attack = int(np.any(predictions == 1))
+
+        if hasattr(model, "predict_proba"):
+            ml_attack_scores = model.predict_proba(X_scaled)[:, 1]
+            ml_attack_mask = ml_attack_scores >= ML_ATTACK_PROBA_THRESHOLD
+        else:
+            predictions = model.predict(X_scaled)
+            ml_attack_mask = predictions == 1
+
+        ml_attack = bool(np.any(ml_attack_mask))
 
     # ---- Rule-based check on window-level stats ----
     rule_attack, rule_reason = rule_based_check(window_stats)
@@ -315,8 +349,15 @@ def process_window():
     # Build reason string
     reasons = []
     if ml_attack:
-        attack_flows = int(np.sum(predictions == 1))
-        reasons.append(f"ML Model ({attack_flows}/{len(flow_features_list)} flows)")
+        attack_flows = int(np.sum(ml_attack_mask))
+        if ml_attack_scores.size:
+            max_score = float(np.max(ml_attack_scores))
+            reasons.append(
+                f"ML Model ({attack_flows}/{len(flow_features_list)} flows, "
+                f"max p={max_score:.2f})"
+            )
+        else:
+            reasons.append(f"ML Model ({attack_flows}/{len(flow_features_list)} flows)")
     if rule_attack:
         reasons.append(f"Rules: {rule_reason}")
     reason_str = " + ".join(reasons) if reasons else "All clear"
@@ -383,6 +424,7 @@ def render_ui():
         st.text(f"Processed:  {st.session_state.total_packets}")
         st.divider()
         st.caption("⚙️ Detection Thresholds")
+        st.text(f"ML Attack p: >={ML_ATTACK_PROBA_THRESHOLD:.2f}")
         st.text(f"SYN Flood:  >{SYN_FLOOD_THRESHOLD} SYNs")
         st.text(f"SYN/ACK:    >{SYN_ACK_RATIO_THRESHOLD}x ratio")
         st.text(f"Vol. Spike: >{VOLUME_SPIKE_THRESHOLD} pkts")
