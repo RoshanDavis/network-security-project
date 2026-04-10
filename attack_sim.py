@@ -243,7 +243,7 @@ def ftp_brute_force():
 
 
 # ============================================================================
-# ML-ONLY ATTACK  (designed to trigger model but stay under rule thresholds)
+# ML-ONLY ATTACKS  (designed to trigger model but stay under rule thresholds)
 # ============================================================================
 
 def ssh_brute_force_ml_only():
@@ -295,6 +295,118 @@ def ssh_brute_force_ml_only():
             total += len(flow_pkts)
 
             _progress("ML-SSH", total, t0, extra="low-and-slow ML-only profile")
+            time.sleep(0.35)
+    except KeyboardInterrupt:
+        _summary(total, t0)
+
+
+def ftp_brute_force_ml_only():
+    """
+    🔷 ML-ONLY FTP BRUTE FORCE — Low-and-slow FTP login abuse.
+    Expected detection: ML only (rules should remain quiet).
+
+    Strategy:
+      - Keep one client source port (single bidirectional flow)
+      - Keep packet volume moderate per round
+      - Keep destination-port diversity low
+    """
+    target_port = 21
+    sport = random.randint(10000, 60000)
+
+    _banner("ML-ONLY FTP BRUTE FORCE", "cyan",
+            f"Target: {TARGET_IP}:{target_port} (FTP)",
+            "Method: Low-and-slow bidirectional FTP login attempts",
+            f"Client source port fixed at: {sport}",
+            "Expected: ML detects, rules stay mostly silent")
+
+    total = 0
+    t0 = time.time()
+    try:
+        while True:
+            flow_pkts = []
+
+            # SYN
+            flow_pkts.append(
+                IP(dst=TARGET_IP) / TCP(sport=sport, dport=target_port, flags="S"))
+
+            # Forward: FTP auth attempts
+            for i in range(random.randint(22, 34)):
+                flow_pkts.append(
+                    IP(dst=TARGET_IP) / TCP(
+                        sport=sport, dport=target_port, flags="PA",
+                        seq=1000 + i * 40)
+                    / (b"USER admin\r\nPASS " + bytes(str(random.randint(100000, 999999)), "ascii") + b"\r\n"))
+
+            # Backward: server responses
+            for i in range(random.randint(14, 24)):
+                flow_pkts.append(
+                    IP(src=TARGET_IP, dst=TARGET_IP) / TCP(
+                        sport=target_port, dport=sport, flags="PA",
+                        seq=2000 + i * 30)
+                    / b"530 Login incorrect\r\n")
+
+            send(flow_pkts, verbose=False)
+            total += len(flow_pkts)
+
+            _progress("ML-FTP", total, t0, extra="low-and-slow ML-only profile")
+            time.sleep(0.35)
+    except KeyboardInterrupt:
+        _summary(total, t0)
+
+
+def ssh_password_spray_ml_only():
+    """
+    🧿 ML-ONLY SSH PASSWORD SPRAY — Username rotation with one weak password.
+    Expected detection: ML only (rules should remain quiet).
+
+    Strategy:
+      - Keep one client source port (single bidirectional flow)
+      - Rotate usernames with consistent password payload pattern
+      - Keep rate low to avoid volumetric rule triggers
+    """
+    target_port = 22
+    sport = random.randint(10000, 60000)
+    usernames = [b"admin", b"root", b"guest", b"test", b"backup", b"operator", b"devops", b"service"]
+
+    _banner("ML-ONLY SSH PASSWORD SPRAY", "indigo",
+            f"Target: {TARGET_IP}:{target_port} (SSH)",
+            "Method: Rotate usernames with repeated weak password attempts",
+            f"Client source port fixed at: {sport}",
+            "Expected: ML detects, rules stay mostly silent")
+
+    total = 0
+    t0 = time.time()
+    try:
+        while True:
+            flow_pkts = []
+
+            # SYN
+            flow_pkts.append(
+                IP(dst=TARGET_IP) / TCP(sport=sport, dport=target_port, flags="S"))
+
+            # Forward: spray one weak password across many usernames
+            attempt_count = random.randint(14, 20)
+            for i in range(attempt_count):
+                user = random.choice(usernames)
+                payload = b"USER " + user + b"\r\nPASS Welcome123!\r\n"
+                flow_pkts.append(
+                    IP(dst=TARGET_IP) / TCP(
+                        sport=sport, dport=target_port, flags="PA",
+                        seq=1000 + i * 45)
+                    / payload)
+
+            # Backward: server denials
+            for i in range(random.randint(10, 18)):
+                flow_pkts.append(
+                    IP(src=TARGET_IP, dst=TARGET_IP) / TCP(
+                        sport=target_port, dport=sport, flags="PA",
+                        seq=2000 + i * 30)
+                    / b"Permission denied\r\n")
+
+            send(flow_pkts, verbose=False)
+            total += len(flow_pkts)
+
+            _progress("ML-SPRAY", total, t0, extra="SSH password spray ML-only profile")
             time.sleep(0.35)
     except KeyboardInterrupt:
         _summary(total, t0)
@@ -434,7 +546,9 @@ ATTACKS = {
     "4": ("🟣 SSH Brute Force        [Hybrid: ML + Rules]", ssh_brute_force),
     "5": ("🟤 FTP Brute Force        [Hybrid: ML + Rules]", ftp_brute_force),
     "6": ("🔵 SSH Brute Force        [ML Only]", ssh_brute_force_ml_only),
-    "7": ("🟢 Normal Traffic         [Should be BENIGN]", normal_traffic),
+    "7": ("🔷 FTP Brute Force        [ML Only]", ftp_brute_force_ml_only),
+    "8": ("🧿 SSH Password Spray     [ML Only]", ssh_password_spray_ml_only),
+    "9": ("🟢 Normal Traffic         [Should be BENIGN]", normal_traffic),
 }
 
 
@@ -449,10 +563,11 @@ def show_menu():
     print(f"\n  ── Hybrid Attacks (ML + Rules) ──")
     for k in ["4", "5"]:
         print(f"    [{k}] {ATTACKS[k][0]}")
-    print(f"\n  ── ML-Only Attack ──")
-    print(f"    [6] {ATTACKS['6'][0]}")
+    print(f"\n  ── ML-Only Attacks ──")
+    for k in ["6", "7", "8"]:
+        print(f"    [{k}] {ATTACKS[k][0]}")
     print(f"\n  ── Verification ──")
-    print(f"    [7] {ATTACKS['7'][0]}")
+    print(f"    [9] {ATTACKS['9'][0]}")
     print(f"\n    [q] Quit\n")
     return input("  Select > ").strip().lower()
 
@@ -460,7 +575,7 @@ def show_menu():
 def main():
     parser = argparse.ArgumentParser(description="Network Attack Simulator")
     parser.add_argument("--attack", "-a", choices=list(ATTACKS.keys()),
-                        help="Run directly: 1=SYN 2=Scan 3=Xmas 4=SSH-Hybrid 5=FTP-Hybrid 6=SSH-MLOnly 7=Normal")
+                        help="Run directly: 1=SYN 2=Scan 3=Xmas 4=SSH-Hybrid 5=FTP-Hybrid 6=SSH-MLOnly 7=FTP-MLOnly 8=SSH-Spray-MLOnly 9=Normal")
     args = parser.parse_args()
 
     if args.attack:
