@@ -118,15 +118,71 @@ def _packet_callback(pkt):
 # Feature Extraction — PER FLOW (not per window)
 #
 # CICIDS2017 features are per-flow, so we group packets bidirectionally
-# and keep forward/backward direction based on the first packet in a flow.
+# and infer a stable forward/backward direction per flow.
 # This produces feature vectors on the same scale the model was trained on.
 # ---------------------------------------------------------------------------
+def _infer_forward_direction(flow_packets, endpoint_a, endpoint_b):
+    """Infer stable client->server orientation for a bidirectional flow."""
+    # Best signal: connection initiator packet (SYN without ACK).
+    for pkt in flow_packets:
+        tcp = pkt[TCP]
+        has_syn = bool(tcp.flags & 0x02)
+        has_ack = bool(tcp.flags & 0x10)
+        if has_syn and not has_ack:
+            return (pkt[IP].src, int(tcp.sport)), (pkt[IP].dst, int(tcp.dport))
+
+    a_port = int(endpoint_a[1])
+    b_port = int(endpoint_b[1])
+
+    # If one side is a likely service port, treat high->low as client->server.
+    if a_port <= 1024 < b_port:
+        return endpoint_b, endpoint_a
+    if b_port <= 1024 < a_port:
+        return endpoint_a, endpoint_b
+
+    # General fallback: lower destination port is usually the service side.
+    if a_port < b_port:
+        return endpoint_b, endpoint_a
+    if b_port < a_port:
+        return endpoint_a, endpoint_b
+
+    # Deterministic last fallback.
+    return endpoint_a, endpoint_b
+
+
+def _split_flow_packets_into_sessions(flow_packets):
+    """Split one 4-tuple packet stream into session-like chunks by SYN starts."""
+    if not flow_packets:
+        return []
+
+    sessions = []
+    current_session = []
+
+    for pkt in flow_packets:
+        tcp = pkt[TCP]
+        has_syn = bool(tcp.flags & 0x02)
+        has_ack = bool(tcp.flags & 0x10)
+        syn_start = has_syn and not has_ack
+
+        # A fresh SYN after traffic likely indicates a new logical session.
+        if syn_start and current_session:
+            sessions.append(current_session)
+            current_session = [pkt]
+        else:
+            current_session.append(pkt)
+
+    if current_session:
+        sessions.append(current_session)
+
+    return sessions
+
+
 def extract_flows(packets):
     """Group packets into bidirectional flows and extract per-flow features."""
     if not packets:
         return [], {}
 
-    # Group packets by bidirectional 4-tuple while preserving first-packet direction.
+    # Group packets by bidirectional 4-tuple.
     flows = {}
     for pkt in packets:
         if TCP not in pkt or IP not in pkt:
@@ -142,11 +198,8 @@ def extract_flows(packets):
 
         if flow_key not in flows:
             flows[flow_key] = {
-                # Match CICFlowMeter semantics: first packet defines forward direction.
-                "forward_src_ip": pkt[IP].src,
-                "forward_src_port": int(pkt[TCP].sport),
-                "forward_dst_ip": pkt[IP].dst,
-                "forward_dst_port": int(pkt[TCP].dport),
+                "endpoint_a": flow_key[0],
+                "endpoint_b": flow_key[1],
                 "packets": [],
             }
 
@@ -154,46 +207,56 @@ def extract_flows(packets):
 
     flow_features_list = []
     for flow in flows.values():
-        fwd_count = 0
-        bwd_count = 0
-        fwd_lengths = []
-        bwd_lengths = []
-        syn_count = 0
-        ack_count = 0
-
-        for pkt in flow["packets"]:
-            tcp = pkt[TCP]
-            # Use full packet length (header + payload), not payload-only length.
-            pkt_len = len(pkt)
-            is_fwd = (
-                pkt[IP].src == flow["forward_src_ip"]
-                and int(tcp.sport) == flow["forward_src_port"]
-                and pkt[IP].dst == flow["forward_dst_ip"]
-                and int(tcp.dport) == flow["forward_dst_port"]
+        sessions = _split_flow_packets_into_sessions(flow["packets"])
+        for session_packets in sessions:
+            forward_src, forward_dst = _infer_forward_direction(
+                session_packets,
+                flow["endpoint_a"],
+                flow["endpoint_b"],
             )
+            forward_src_ip, forward_src_port = forward_src
+            forward_dst_ip, forward_dst_port = forward_dst
 
-            if is_fwd:
-                fwd_count += 1
-                fwd_lengths.append(pkt_len)
-            else:
-                bwd_count += 1
-                bwd_lengths.append(pkt_len)
+            fwd_count = 0
+            bwd_count = 0
+            fwd_lengths = []
+            bwd_lengths = []
+            syn_count = 0
+            ack_count = 0
 
-            if tcp.flags & 0x02:
-                syn_count += 1
-            if tcp.flags & 0x10:
-                ack_count += 1
+            for pkt in session_packets:
+                tcp = pkt[TCP]
+                # Use full packet length (header + payload), not payload-only length.
+                pkt_len = len(pkt)
+                is_fwd = (
+                    pkt[IP].src == forward_src_ip
+                    and int(tcp.sport) == forward_src_port
+                    and pkt[IP].dst == forward_dst_ip
+                    and int(tcp.dport) == forward_dst_port
+                )
 
-        features = [
-            flow["forward_dst_port"],
-            fwd_count,
-            bwd_count,
-            float(np.mean(fwd_lengths)) if fwd_lengths else 0.0,
-            float(np.mean(bwd_lengths)) if bwd_lengths else 0.0,
-            syn_count,
-            ack_count,
-        ]
-        flow_features_list.append(features)
+                if is_fwd:
+                    fwd_count += 1
+                    fwd_lengths.append(pkt_len)
+                else:
+                    bwd_count += 1
+                    bwd_lengths.append(pkt_len)
+
+                if tcp.flags & 0x02:
+                    syn_count += 1
+                if tcp.flags & 0x10:
+                    ack_count += 1
+
+            features = [
+                forward_dst_port,
+                fwd_count,
+                bwd_count,
+                float(np.mean(fwd_lengths)) if fwd_lengths else 0.0,
+                float(np.mean(bwd_lengths)) if bwd_lengths else 0.0,
+                syn_count,
+                ack_count,
+            ]
+            flow_features_list.append(features)
 
     # Window-level summary stats for rules engine
     total_syn = sum(f[5] for f in flow_features_list)

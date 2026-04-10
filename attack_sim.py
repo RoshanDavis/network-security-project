@@ -2,7 +2,7 @@
 🚨 Network Attack Simulator — Multi-Attack Suite
 ==================================================
 Simulates different types of network attacks to test the IDS dashboard.
-Includes attacks that trigger the ML model and a normal traffic generator.
+Includes rule-based, hybrid, and ML-only attack profiles plus normal traffic.
 
 MUST be run from an Administrator PowerShell:
     python attack_sim.py
@@ -124,16 +124,18 @@ def xmas_tree():
 
 
 # ============================================================================
-# ML-MODEL-DETECTED ATTACKS  (trigger the Random Forest classifier)
+# HYBRID ATTACKS  (primarily ML-driven, but can also trigger rules)
 # ============================================================================
 
 def ssh_brute_force():
     """
     🟣 SSH BRUTE FORCE — Mimics rapid SSH login attempts.
-    Detected by: ML MODEL (port 22, many bidirectional packets, small payloads)
+    Detected by: HYBRID (ML + possible rules)
 
     The ML model learned from CICIDS2017 that flows to port 22 with many
     forward AND backward packets and small payloads are SSH brute-force attacks.
+    At high burst rates, this traffic can also trip rule heuristics (especially
+    unique destination-port counts from server responses to many client ports).
     Each simulated "login attempt" is a flow with:
       - SYN + multiple data packets (small payload simulating password attempts)
       - ACK packets (simulating server responses)
@@ -145,7 +147,7 @@ def ssh_brute_force():
             f"Target: {TARGET_IP}:{target_port} (SSH)",
             f"Method: Simulated login attempts with bidirectional traffic",
             f"Burst: {attempts_per_burst} 'login attempts' per round",
-            "Detected by: ML Model → matches CICIDS2017 SSH-Patator pattern")
+            "Detected by: Hybrid → ML pattern + possible port-count rule trigger")
 
     total = 0
     t0 = time.time()
@@ -187,10 +189,12 @@ def ssh_brute_force():
 def ftp_brute_force():
     """
     🟤 FTP BRUTE FORCE — Mimics rapid FTP login attempts.
-    Detected by: ML MODEL (port 21, many bidirectional packets, small payloads)
+    Detected by: HYBRID (ML + possible rules)
 
     Similar to SSH brute force — the model flags flows to port 21 with
     many packets in both directions and small payload sizes.
+    At high burst rates, this can also trigger rules because responses target
+    many client ephemeral ports within one detection window.
     """
     target_port = 21
     attempts_per_burst = 20
@@ -199,7 +203,7 @@ def ftp_brute_force():
             f"Target: {TARGET_IP}:{target_port} (FTP)",
             "Method: Simulated FTP login attempts with bidirectional traffic",
             f"Burst: {attempts_per_burst} 'login attempts' per round",
-            "Detected by: ML Model → matches CICIDS2017 FTP-Patator pattern")
+            "Detected by: Hybrid → ML pattern + possible port-count rule trigger")
 
     total = 0
     t0 = time.time()
@@ -234,6 +238,64 @@ def ftp_brute_force():
 
             _progress("FTP", total, t0, extra=f"{attempts_per_burst} attempts/burst")
             time.sleep(0.1)
+    except KeyboardInterrupt:
+        _summary(total, t0)
+
+
+# ============================================================================
+# ML-ONLY ATTACK  (designed to trigger model but stay under rule thresholds)
+# ============================================================================
+
+def ssh_brute_force_ml_only():
+    """
+    🔵 ML-ONLY SSH BRUTE FORCE — Low-and-slow single-flow login abuse.
+    Expected detection: ML only (rules should remain quiet).
+
+    Strategy:
+      - Keep one client source port (single bidirectional flow)
+      - Keep packet volume moderate per round
+      - Keep destination-port diversity low
+    """
+    target_port = 22
+    sport = random.randint(10000, 60000)
+
+    _banner("ML-ONLY SSH BRUTE FORCE", "blue",
+            f"Target: {TARGET_IP}:{target_port} (SSH)",
+            f"Method: Low-and-slow bidirectional login attempts on one flow",
+            f"Client source port fixed at: {sport}",
+            "Expected: ML detects, rules stay mostly silent")
+
+    total = 0
+    t0 = time.time()
+    try:
+        while True:
+            flow_pkts = []
+
+            # SYN
+            flow_pkts.append(
+                IP(dst=TARGET_IP) / TCP(sport=sport, dport=target_port, flags="S"))
+
+            # Forward: password attempts (small payloads)
+            for i in range(random.randint(15, 22)):
+                flow_pkts.append(
+                    IP(dst=TARGET_IP) / TCP(
+                        sport=sport, dport=target_port, flags="PA",
+                        seq=1000 + i * 40)
+                    / (b"USER admin\r\nPASS " + bytes(str(random.randint(100000, 999999)), "ascii") + b"\r\n"))
+
+            # Backward: server responses
+            for i in range(random.randint(10, 18)):
+                flow_pkts.append(
+                    IP(src=TARGET_IP, dst=TARGET_IP) / TCP(
+                        sport=target_port, dport=sport, flags="PA",
+                        seq=2000 + i * 30)
+                    / b"Permission denied\r\n")
+
+            send(flow_pkts, verbose=False)
+            total += len(flow_pkts)
+
+            _progress("ML-SSH", total, t0, extra="low-and-slow ML-only profile")
+            time.sleep(0.35)
     except KeyboardInterrupt:
         _summary(total, t0)
 
@@ -369,9 +431,10 @@ ATTACKS = {
     "1": ("🔴 SYN Flood              [Rules]", syn_flood),
     "2": ("🟡 Port Scan              [Rules]", port_scan),
     "3": ("🎄 Christmas Tree Attack  [Rules]", xmas_tree),
-    "4": ("🟣 SSH Brute Force        [ML Model]", ssh_brute_force),
-    "5": ("🟤 FTP Brute Force        [ML Model]", ftp_brute_force),
-    "6": ("🟢 Normal Traffic         [Should be BENIGN]", normal_traffic),
+    "4": ("🟣 SSH Brute Force        [Hybrid: ML + Rules]", ssh_brute_force),
+    "5": ("🟤 FTP Brute Force        [Hybrid: ML + Rules]", ftp_brute_force),
+    "6": ("🔵 SSH Brute Force        [ML Only]", ssh_brute_force_ml_only),
+    "7": ("🟢 Normal Traffic         [Should be BENIGN]", normal_traffic),
 }
 
 
@@ -383,11 +446,13 @@ def show_menu():
     print(f"  ── Rule-Detected Attacks ──")
     for k in ["1", "2", "3"]:
         print(f"    [{k}] {ATTACKS[k][0]}")
-    print(f"\n  ── ML-Model-Detected Attacks ──")
+    print(f"\n  ── Hybrid Attacks (ML + Rules) ──")
     for k in ["4", "5"]:
         print(f"    [{k}] {ATTACKS[k][0]}")
-    print(f"\n  ── Verification ──")
+    print(f"\n  ── ML-Only Attack ──")
     print(f"    [6] {ATTACKS['6'][0]}")
+    print(f"\n  ── Verification ──")
+    print(f"    [7] {ATTACKS['7'][0]}")
     print(f"\n    [q] Quit\n")
     return input("  Select > ").strip().lower()
 
@@ -395,7 +460,7 @@ def show_menu():
 def main():
     parser = argparse.ArgumentParser(description="Network Attack Simulator")
     parser.add_argument("--attack", "-a", choices=list(ATTACKS.keys()),
-                        help="Run directly: 1=SYN 2=Scan 3=Xmas 4=SSH 5=FTP 6=Normal")
+                        help="Run directly: 1=SYN 2=Scan 3=Xmas 4=SSH-Hybrid 5=FTP-Hybrid 6=SSH-MLOnly 7=Normal")
     args = parser.parse_args()
 
     if args.attack:
