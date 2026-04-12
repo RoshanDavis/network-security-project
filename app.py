@@ -61,7 +61,7 @@ XMAS_FLAG_MASK = 0x29          # FIN+PSH+URG flags (Christmas Tree attack)
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def load_model_and_scaler():
-    model_path = os.path.join(MODELS_DIR, "rf_model.joblib")
+    model_path = os.path.join(MODELS_DIR, "best_model.joblib")
     scaler_path = os.path.join(MODELS_DIR, "scaler.joblib")
     if not os.path.exists(model_path) or not os.path.exists(scaler_path):
         return None, None
