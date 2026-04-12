@@ -364,11 +364,12 @@ if "history" not in st.session_state:
     st.session_state.latest_prediction = "WAITING"
     st.session_state.latest_features = None
     st.session_state.latest_reason = ""
+    st.session_state.latest_detection_layer = "N/A"
     st.session_state.total_packets = 0
 
 
 # ---------------------------------------------------------------------------
-# Process Window (hybrid: ML model + rules)
+# Process Window (sequential filter: Rules -> ML)
 # ---------------------------------------------------------------------------
 def process_window():
     with shared.lock:
@@ -385,48 +386,60 @@ def process_window():
     if not flow_features_list:
         return
 
-    # ---- ML Model: predict on each flow, attack if ANY flow is attack ----
-    ml_attack = False
-    ml_attack_mask = np.array([], dtype=bool)
-    ml_attack_scores = np.array([], dtype=float)
-    if model and scaler:
-        X = np.array(flow_features_list, dtype=float)
-        X_scaled = scaler.transform(X)
-
-        if hasattr(model, "predict_proba"):
-            ml_attack_scores = model.predict_proba(X_scaled)[:, 1]
-            ml_attack_mask = ml_attack_scores >= ML_ATTACK_PROBA_THRESHOLD
-        else:
-            predictions = model.predict(X_scaled)
-            ml_attack_mask = predictions == 1
-
-        ml_attack = bool(np.any(ml_attack_mask))
-
-    # ---- Rule-based check on window-level stats ----
+    # ---- Step 1: Rule-based check on window-level stats ----
     rule_attack, rule_reason = rule_based_check(window_stats)
 
-    # ---- Combine: attack if EITHER detector fires ----
-    is_attack = ml_attack or rule_attack
-    label = "ATTACK" if is_attack else "BENIGN"
+    label = "BENIGN"
+    reason_str = "Sequential filter passed: rules clear and ML clear"
+    detection_layer = "No Detection"
 
-    # Build reason string
-    reasons = []
-    if ml_attack:
-        attack_flows = int(np.sum(ml_attack_mask))
-        if ml_attack_scores.size:
-            max_score = float(np.max(ml_attack_scores))
-            reasons.append(
-                f"ML Model ({attack_flows}/{len(flow_features_list)} flows, "
-                f"max p={max_score:.2f})"
-            )
-        else:
-            reasons.append(f"ML Model ({attack_flows}/{len(flow_features_list)} flows)")
+    # ---- Step 2: Short-circuit on rules to skip ML compute entirely ----
     if rule_attack:
-        reasons.append(f"Rules: {rule_reason}")
-    reason_str = " + ".join(reasons) if reasons else "All clear"
+        label = "ATTACK"
+        detection_layer = "Caught by Volumetric Rules"
+        reason_str = f"{detection_layer}: {rule_reason}"
+    else:
+        # ---- Step 3: ML inference only for rule-benign traffic ----
+        ml_attack = False
+        ml_attack_mask = np.array([], dtype=bool)
+        ml_attack_scores = np.array([], dtype=float)
+
+        if model and scaler:
+            X = np.array(flow_features_list, dtype=float)
+            X_scaled = scaler.transform(X)
+
+            if hasattr(model, "predict_proba"):
+                ml_attack_scores = model.predict_proba(X_scaled)[:, 1]
+                ml_attack_mask = ml_attack_scores >= ML_ATTACK_PROBA_THRESHOLD
+            else:
+                predictions = model.predict(X_scaled)
+                ml_attack_mask = predictions == 1
+
+            ml_attack = bool(np.any(ml_attack_mask))
+
+        if ml_attack:
+            label = "ATTACK"
+            detection_layer = "Caught by ML Inference"
+            attack_flows = int(np.sum(ml_attack_mask))
+            if ml_attack_scores.size:
+                max_score = float(np.max(ml_attack_scores))
+                reason_str = (
+                    f"{detection_layer}: {attack_flows}/{len(flow_features_list)} flows "
+                    f"flagged (max p={max_score:.2f})"
+                )
+            else:
+                reason_str = (
+                    f"{detection_layer}: {attack_flows}/{len(flow_features_list)} flows flagged"
+                )
+        elif model and scaler:
+            detection_layer = "Sequential Filter Passed (Benign)"
+        else:
+            detection_layer = "Rules-Only Mode (ML Unavailable)"
+            reason_str = "Rules clear; ML inference unavailable"
 
     st.session_state.latest_prediction = label
     st.session_state.latest_reason = reason_str
+    st.session_state.latest_detection_layer = detection_layer
 
     # Use the aggregate for display
     agg_features = [
@@ -447,6 +460,7 @@ def process_window():
         "syn_count": window_stats["total_syn"],
         "ack_count": window_stats["total_ack"],
         "prediction": label,
+        "layer": detection_layer,
         "reason": reason_str,
     })
 
@@ -458,7 +472,7 @@ def render_ui():
     st.markdown(
         "<h1 style='text-align:center;'>🛡️ Network Intrusion Detection System</h1>"
         "<p style='text-align:center; color:gray;'>"
-        "Hybrid Detection: ML Model + Rule-Based Anomaly Engine"
+        "Sequential Hybrid Detection: Volumetric Rules → ML Inference"
         "</p>",
         unsafe_allow_html=True,
     )
@@ -470,7 +484,7 @@ def render_ui():
     if model is None or scaler is None:
         st.error(
             "❌ **Model files not found.** Run the training notebook first to generate:\n"
-            "- `models/rf_model.joblib`\n- `models/scaler.joblib`"
+            "- `models/best_model.joblib`\n- `models/scaler.joblib`"
         )
         return
 
@@ -485,6 +499,10 @@ def render_ui():
         st.text(f"Running:    {shared.sniffer_started}")
         st.text(f"Captured:   {shared.capture_count}")
         st.text(f"Processed:  {st.session_state.total_packets}")
+        st.text(f"Layer:      {st.session_state.get('latest_detection_layer', 'N/A')}")
+        st.divider()
+        st.caption("🧠 Pipeline")
+        st.text("Rules -> ML (short-circuit)")
         st.divider()
         st.caption("⚙️ Detection Thresholds")
         st.text(f"ML Attack p: >={ML_ATTACK_PROBA_THRESHOLD:.2f}")
@@ -543,11 +561,12 @@ def render_ui():
     history = st.session_state.history
     if history:
         latest = history[-1]
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("📦 Packets", latest["packets"])
         col2.metric("🔄 SYN Flags", latest["syn_count"])
         col3.metric("✔️ ACK Flags", latest["ack_count"])
         col4.metric("🌐 Flows", latest["flows"])
+        col5.metric("🧭 Layer", latest["layer"])
 
     # --- Traffic Chart ---
     if len(history) > 1:
@@ -559,7 +578,7 @@ def render_ui():
     if history:
         st.subheader("📋 Recent Window Predictions")
         table_df = pd.DataFrame(list(history))
-        table_df = table_df[["time", "packets", "flows", "syn_count", "ack_count", "prediction", "reason"]]
+        table_df = table_df[["time", "packets", "flows", "syn_count", "ack_count", "prediction", "layer", "reason"]]
         st.dataframe(table_df.iloc[::-1], width="stretch", height=250)
 
     # --- Feature Debug ---
