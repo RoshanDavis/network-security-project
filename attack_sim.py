@@ -186,62 +186,6 @@ def ssh_brute_force():
         _summary(total, t0)
 
 
-def ftp_brute_force():
-    """
-    🟤 FTP BRUTE FORCE — Mimics rapid FTP login attempts.
-    Detected by: HYBRID (ML + possible rules)
-
-    Similar to SSH brute force — the model flags flows to port 21 with
-    many packets in both directions and small payload sizes.
-    At high burst rates, this can also trigger rules because responses target
-    many client ephemeral ports within one detection window.
-    """
-    target_port = 21
-    attempts_per_burst = 20
-
-    _banner("FTP BRUTE FORCE", "brown",
-            f"Target: {TARGET_IP}:{target_port} (FTP)",
-            "Method: Simulated FTP login attempts with bidirectional traffic",
-            f"Burst: {attempts_per_burst} 'login attempts' per round",
-            "Detected by: Hybrid → ML pattern + possible port-count rule trigger")
-
-    total = 0
-    t0 = time.time()
-    try:
-        while True:
-            for _ in range(attempts_per_burst):
-                sport = random.randint(10000, 60000)
-                flow_pkts = []
-
-                # SYN
-                flow_pkts.append(
-                    IP(dst=TARGET_IP) / TCP(sport=sport, dport=target_port, flags="S"))
-
-                # Forward: FTP commands
-                for i in range(random.randint(20, 35)):
-                    flow_pkts.append(
-                        IP(dst=TARGET_IP) / TCP(
-                            sport=sport, dport=target_port, flags="PA",
-                            seq=1000 + i * 40)
-                        / (b"USER admin\r\nPASS " + bytes(str(random.randint(100000, 999999)), "ascii") + b"\r\n"))
-
-                # Backward: server responses
-                for i in range(random.randint(15, 25)):
-                    flow_pkts.append(
-                        IP(src=TARGET_IP, dst=TARGET_IP) / TCP(
-                            sport=target_port, dport=sport, flags="PA",
-                            seq=2000 + i * 30)
-                        / b"530 Login incorrect\r\n")
-
-                send(flow_pkts, verbose=False)
-                total += len(flow_pkts)
-
-            _progress("FTP", total, t0, extra=f"{attempts_per_burst} attempts/burst")
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        _summary(total, t0)
-
-
 # ============================================================================
 # ML-ONLY ATTACKS  (designed to trigger model but stay under rule thresholds)
 # ============================================================================
@@ -295,60 +239,6 @@ def ssh_brute_force_ml_only():
             total += len(flow_pkts)
 
             _progress("ML-SSH", total, t0, extra="low-and-slow ML-only profile")
-            time.sleep(0.35)
-    except KeyboardInterrupt:
-        _summary(total, t0)
-
-
-def ftp_brute_force_ml_only():
-    """
-    🔷 ML-ONLY FTP BRUTE FORCE — Low-and-slow FTP login abuse.
-    Expected detection: ML only (rules should remain quiet).
-
-    Strategy:
-      - Keep one client source port (single bidirectional flow)
-      - Keep packet volume moderate per round
-      - Keep destination-port diversity low
-    """
-    target_port = 21
-    sport = random.randint(10000, 60000)
-
-    _banner("ML-ONLY FTP BRUTE FORCE", "cyan",
-            f"Target: {TARGET_IP}:{target_port} (FTP)",
-            "Method: Low-and-slow bidirectional FTP login attempts",
-            f"Client source port fixed at: {sport}",
-            "Expected: ML detects, rules stay mostly silent")
-
-    total = 0
-    t0 = time.time()
-    try:
-        while True:
-            flow_pkts = []
-
-            # SYN
-            flow_pkts.append(
-                IP(dst=TARGET_IP) / TCP(sport=sport, dport=target_port, flags="S"))
-
-            # Forward: FTP auth attempts
-            for i in range(random.randint(22, 34)):
-                flow_pkts.append(
-                    IP(dst=TARGET_IP) / TCP(
-                        sport=sport, dport=target_port, flags="PA",
-                        seq=1000 + i * 40)
-                    / (b"USER admin\r\nPASS " + bytes(str(random.randint(100000, 999999)), "ascii") + b"\r\n"))
-
-            # Backward: server responses
-            for i in range(random.randint(14, 24)):
-                flow_pkts.append(
-                    IP(src=TARGET_IP, dst=TARGET_IP) / TCP(
-                        sport=target_port, dport=sport, flags="PA",
-                        seq=2000 + i * 30)
-                    / b"530 Login incorrect\r\n")
-
-            send(flow_pkts, verbose=False)
-            total += len(flow_pkts)
-
-            _progress("ML-FTP", total, t0, extra="low-and-slow ML-only profile")
             time.sleep(0.35)
     except KeyboardInterrupt:
         _summary(total, t0)
@@ -544,11 +434,9 @@ ATTACKS = {
     "2": ("🟡 Port Scan              [Rules]", port_scan),
     "3": ("🎄 Christmas Tree Attack  [Rules]", xmas_tree),
     "4": ("🟣 SSH Brute Force        [Hybrid: ML + Rules]", ssh_brute_force),
-    "5": ("🟤 FTP Brute Force        [Hybrid: ML + Rules]", ftp_brute_force),
-    "6": ("🔵 SSH Brute Force        [ML Only]", ssh_brute_force_ml_only),
-    "7": ("🔷 FTP Brute Force        [ML Only]", ftp_brute_force_ml_only),
-    "8": ("🧿 SSH Password Spray     [ML Only]", ssh_password_spray_ml_only),
-    "9": ("🟢 Normal Traffic         [Should be BENIGN]", normal_traffic),
+    "5": ("🔵 SSH Brute Force        [ML Only]", ssh_brute_force_ml_only),
+    "6": ("🧿 SSH Password Spray     [ML Only]", ssh_password_spray_ml_only),
+    "7": ("🟢 Normal Traffic         [Should be BENIGN]", normal_traffic),
 }
 
 
@@ -561,13 +449,13 @@ def show_menu():
     for k in ["1", "2", "3"]:
         print(f"    [{k}] {ATTACKS[k][0]}")
     print(f"\n  ── Hybrid Attacks (ML + Rules) ──")
-    for k in ["4", "5"]:
+    for k in ["4"]:
         print(f"    [{k}] {ATTACKS[k][0]}")
     print(f"\n  ── ML-Only Attacks ──")
-    for k in ["6", "7", "8"]:
+    for k in ["5", "6"]:
         print(f"    [{k}] {ATTACKS[k][0]}")
     print(f"\n  ── Verification ──")
-    print(f"    [9] {ATTACKS['9'][0]}")
+    print(f"    [7] {ATTACKS['7'][0]}")
     print(f"\n    [q] Quit\n")
     return input("  Select > ").strip().lower()
 
@@ -575,7 +463,7 @@ def show_menu():
 def main():
     parser = argparse.ArgumentParser(description="Network Attack Simulator")
     parser.add_argument("--attack", "-a", choices=list(ATTACKS.keys()),
-                        help="Run directly: 1=SYN 2=Scan 3=Xmas 4=SSH-Hybrid 5=FTP-Hybrid 6=SSH-MLOnly 7=FTP-MLOnly 8=SSH-Spray-MLOnly 9=Normal")
+                        help="Run directly: 1=SYN 2=Scan 3=Xmas 4=SSH-Hybrid 5=SSH-MLOnly 6=SSH-Spray-MLOnly 7=Normal")
     args = parser.parse_args()
 
     if args.attack:
