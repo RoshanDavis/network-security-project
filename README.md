@@ -38,7 +38,7 @@ pip install -r requirements.txt
 ```
 
 ### 3. Download the CICIDS2017 dataset
-
+If data folder does not exist:
 1. Go to the [UNB CICIDS2017 page](https://www.unb.ca/cic/datasets/ids-2017.html) or download from [Kaggle](https://www.kaggle.com/datasets/uciml/cicids2017).
 2. Download the **MachineLearningCSV.zip** file.
 3. Extract all CSV files into the `data/` folder:
